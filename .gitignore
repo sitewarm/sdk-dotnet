@@ -1,0 +1,6 @@
+bin/
+obj/
+/build/
+.vs/
+*.user
+.DS_Store
