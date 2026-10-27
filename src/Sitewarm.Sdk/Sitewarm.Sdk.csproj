@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Sitewarm.Sdk</RootNamespace>
+    <AssemblyName>Sitewarm.Sdk</AssemblyName>
+    <PackageId>Sitewarm.Sdk</PackageId>
+    <Version>0.1.0-preview</Version>
+    <Description>.NET client for the sitewarm API (pre-release)</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/sitewarm/sdk-dotnet</RepositoryUrl>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- Generated code is not documented. -->
+    <NoWarn>$(NoWarn);CS1591;CS8618;CS0108;CS0114;CS0472;CS8603;CS8604;CS8625;CS8600;CS8601;CS8602;CS8619;CS8620;CS8765;CS8767</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Sitewarm.Sdk.Tests" />
+  </ItemGroup>
+
+</Project>
