@@ -2,9 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
+using System.Reflection;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -34,6 +38,14 @@ public sealed class SiteWarmClient : IDisposable
     private static readonly Regex Slug = new("^[a-z0-9-]+$", RegexOptions.Compiled);
 
     internal static readonly JsonSerializerOptions Json = BuildJsonOptions();
+
+    /// <summary>SDK version (the project's <c>Version</c>), sent in the User-Agent.</summary>
+    public static readonly string Version =
+        (typeof(SiteWarmClient).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "0.1.0-preview")
+        .Split('+')[0];
+
+    /// <summary>The User-Agent used when <see cref="SiteWarmOptions.UserAgent"/> is empty.</summary>
+    public static readonly string DefaultUserAgent = "sitewarm-dotnet/" + Version + " (+https://github.com/sitewarm/sdk-dotnet)";
 
     /// <summary>Largest response body that is read (32 MiB).</summary>
     internal const int MaxBodyBytes = 32 << 20;
@@ -202,6 +214,11 @@ public sealed class SiteWarmClient : IDisposable
         // 429 = not processed. 5xx, network errors and broken bodies may have been, so retry them only when repeating
         // is safe: GET, HEAD, PUT, OPTIONS, or a POST with an Idempotency-Key. DELETE and PATCH: 429 only.
         bool retryAmbiguous = op.Method is "GET" or "HEAD" or "PUT" or "OPTIONS" || sendsKey;
+        // An empty UserAgent keeps the default.
+        string userAgent = string.IsNullOrEmpty(_o.UserAgent) ? DefaultUserAgent : _o.UserAgent;
+        // A header value with control characters is a malformed request that repeating cannot fix; the value is not echoed.
+        if (HasControlChars(userAgent) || (key != null && HasControlChars(key)))
+            throw new SiteWarmException("malformed request (invalid header value)");
 
         for (int attempt = 0; ; attempt++)
         {
@@ -209,7 +226,7 @@ public sealed class SiteWarmClient : IDisposable
             using var msg = new HttpRequestMessage(new HttpMethod(op.Method), url.ToString());
             msg.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
             msg.Headers.TryAddWithoutValidation("Accept", "application/json, application/problem+json");
-            msg.Headers.TryAddWithoutValidation("User-Agent", _o.UserAgent);
+            msg.Headers.TryAddWithoutValidation("User-Agent", userAgent);
             if (key != null) msg.Headers.TryAddWithoutValidation("Idempotency-Key", key);
             if (body != null) msg.Content = new StringContent(body, Encoding.UTF8, new MediaTypeHeaderValue("application/json"));
 
@@ -230,7 +247,7 @@ public sealed class SiteWarmClient : IDisposable
             {
                 resp?.Dispose();
                 // A body that breaks off is as ambiguous as a network error, except after a 429.
-                if (!last && (retryAmbiguous || statusSoFar == 429))
+                if (!last && (retryAmbiguous || statusSoFar == 429) && IsTransient(e))
                 {
                     await _delay(Backoff(attempt), ct).ConfigureAwait(false);
                     continue;
@@ -251,22 +268,67 @@ public sealed class SiteWarmClient : IDisposable
                 var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var h in resp.Headers) headers[h.Key] = string.Join(", ", h.Value);
                 foreach (var h in resp.Content.Headers) headers[h.Key] = string.Join(", ", h.Value);
-                if (status is >= 200 and < 300) return new SiteWarmResponse(status, headers, text);
+                if (status is >= 200 and < 300)
+                {
+                    // A 2xx body that is not JSON (an HTML page from a proxy, say) is a typed error that never includes the body.
+                    if (status != 204 && !string.IsNullOrWhiteSpace(text))
+                    {
+                        try { using var _ = JsonDocument.Parse(text); }
+                        catch (JsonException) { throw new DecodeException(status); }
+                    }
+                    return new SiteWarmResponse(status, headers, text);
+                }
 
                 var retryAfter = ParseRetryAfter(headers.GetValueOrDefault("Retry-After"), _clock());
+                var error = ApiError(status, text, headers, retryAfter);
                 bool retryable = status == 429 || (status >= 500 && status != 501 && retryAmbiguous);
+                // A 409 "conflict" on a keyed POST is the original request still running (a timeout retry racing it).
+                // "idempotency-key-reused" is a caller bug and is never retried.
+                if (status == 409 && sendsKey && error.Code == "conflict") retryable = true;
                 if (retryable && !last)
                 {
-                    var wait = retryAfter ?? Backoff(attempt);
-                    if (wait <= _o.RetryMax) // a longer server-provided wait is surfaced, not ignored
+                    // Never a hot retry on "Retry-After: 0" or a date in the past; jitter spreads clients out.
+                    // A server-provided wait longer than the cap is surfaced, not slept.
+                    TimeSpan? floored = retryAfter is { } ra ? (ra < _o.RetryBase ? _o.RetryBase : ra) : null;
+                    if (floored is null || floored <= _o.RetryMax)
                     {
+                        var wait = floored is { } f
+                            ? f + TimeSpan.FromMilliseconds(RandomNumberGenerator.GetInt32(0, 1_000_000) / 1_000_000.0 * f.TotalMilliseconds / 4)
+                            : Backoff(attempt);
                         await _delay(wait, ct).ConfigureAwait(false);
                         continue;
                     }
                 }
-                throw ApiError(status, text, headers, retryAfter);
+                throw error;
             }
         }
+    }
+
+    private static bool HasControlChars(string s) => s.Any(ch => ch < 0x20 && ch != '\t' || ch == 0x7f);
+
+    /// <summary>
+    /// False for failures that repeating cannot fix: TLS/certificate failures, an unknown host (a temporary DNS failure
+    /// is still retried) and malformed requests. Other network errors are retried.
+    /// </summary>
+    internal static bool IsTransient(Exception e)
+    {
+        bool nameResolution = false;
+        for (Exception? x = e; x != null; x = x.InnerException)
+        {
+            if (x is AuthenticationException) return false;
+            if (x is HttpRequestException h)
+            {
+                if (h.HttpRequestError == HttpRequestError.SecureConnectionError) return false;
+                if (h.HttpRequestError == HttpRequestError.NameResolutionError) nameResolution = true;
+            }
+            if (x is SocketException s)
+            {
+                if (s.SocketErrorCode == SocketError.TryAgain) return true;
+                if (s.SocketErrorCode is SocketError.HostNotFound or SocketError.NoData) return false;
+            }
+            if (x is FormatException or ArgumentException or UriFormatException) return false;
+        }
+        return !nameResolution;
     }
 
     private static ApiException ApiError(int status, string text, Dictionary<string, string> headers, TimeSpan? retryAfter)

@@ -16,7 +16,8 @@ public sealed class SiteWarmOptions
     public TimeSpan RetryMax { get; set; } = TimeSpan.FromSeconds(30);
     /// <summary>Per-attempt timeout. Default 30 s.</summary>
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
-    public string UserAgent { get; set; } = "sitewarm-dotnet";
+    /// <summary>Default <c>sitewarm-dotnet/&lt;version&gt; (+https://github.com/sitewarm/sdk-dotnet)</c>; null or empty keeps the default.</summary>
+    public string UserAgent { get; set; } = SiteWarmClient.DefaultUserAgent;
     /// <summary>Custom handler (tests, proxies). The default never follows redirects, so the key never goes to another origin.</summary>
     public HttpMessageHandler? Handler { get; set; }
     /// <summary>Replaces <see cref="Task.Delay(TimeSpan, CancellationToken)"/>; for tests.</summary>

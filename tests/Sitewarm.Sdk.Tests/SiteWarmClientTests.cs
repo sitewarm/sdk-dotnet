@@ -106,7 +106,9 @@ public class SiteWarmClientTests
         var (c, f, clock) = Make((n, _) => n < 3 ? Reply(429, "{}", ("Retry-After", "2")) : Reply(200, "{\"id\":\"s1\"}"));
         await c.CallAsync<JsonElement>("getSite", new Request().WithPath("siteId", "s1"));
         Assert.Equal(3, f.Seen.Count);
-        Assert.Equal(new[] { TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2) }, clock.Slept);
+        Assert.Equal(2, clock.Slept.Count);
+        // Retry-After plus up to 25% jitter
+        Assert.All(clock.Slept, d => Assert.InRange(d, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2.5)));
     }
 
     [Fact]

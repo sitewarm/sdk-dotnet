@@ -17,6 +17,14 @@ public sealed class ConnectionException : SiteWarmException
     public ConnectionException(string message, bool timeout = false) : base(message) => Timeout = timeout;
 }
 
+/// <summary>A 2xx response body was not valid JSON (for example an HTML page from a proxy). Never includes the body.</summary>
+public sealed class DecodeException : SiteWarmException
+{
+    public int Status { get; }
+
+    public DecodeException(int status) : base($"invalid JSON in {status} response") => Status = status;
+}
+
 /// <summary>The response body was larger than the SDK reads (32 MiB). Not retried.</summary>
 public sealed class ResponseTooLargeException : SiteWarmException
 {
