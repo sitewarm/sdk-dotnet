@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
@@ -34,7 +35,13 @@ public sealed class SiteWarmClient : IDisposable
 
     internal static readonly JsonSerializerOptions Json = BuildJsonOptions();
 
+    /// <summary>Largest response body that is read (32 MiB).</summary>
+    internal const int MaxBodyBytes = 32 << 20;
+    private const int DefaultMaxPages = 10_000;
+
     private readonly string _apiKey;
+    private readonly int _maxRetries;
+    private readonly TimeSpan _timeout;
     private readonly string _baseUrl;
     private readonly SiteWarmOptions _o;
     private readonly HttpClient _http;
@@ -52,6 +59,10 @@ public sealed class SiteWarmClient : IDisposable
         _apiKey = apiKey;
         _baseUrl = Normalize(baseUrl);
         _o = options ?? new SiteWarmOptions();
+        // A negative MaxRetries or a Timeout <= 0 keeps the default.
+        _maxRetries = _o.MaxRetries >= 0 ? _o.MaxRetries : 3;
+        _timeout = _o.Timeout > TimeSpan.Zero ? _o.Timeout : TimeSpan.FromSeconds(30);
+        if (_o.Handler != null) DisableRedirects(_o.Handler);
         _http = new HttpClient(_o.Handler ?? new SocketsHttpHandler { AllowAutoRedirect = false, UseCookies = false }, disposeHandler: _o.Handler == null)
         {
             Timeout = System.Threading.Timeout.InfiniteTimeSpan,
@@ -66,6 +77,61 @@ public sealed class SiteWarmClient : IDisposable
     public override string ToString() => "SiteWarmClient{baseUrl=" + _baseUrl + "}";
 
     public void Dispose() => _http.Dispose();
+
+    /// <summary>
+    /// Authorization must not survive a redirect, even with a caller-supplied handler: redirects are switched off on
+    /// every <see cref="HttpClientHandler"/> / <see cref="SocketsHttpHandler"/> in the chain. A handler of another kind
+    /// that follows redirects by itself cannot be detected up front; a followed redirect is still rejected after the fact.
+    /// </summary>
+    private static void DisableRedirects(HttpMessageHandler handler)
+    {
+        for (HttpMessageHandler? h = handler; h != null; h = (h as DelegatingHandler)?.InnerHandler)
+        {
+            try
+            {
+                if (h is HttpClientHandler hc) hc.AllowAutoRedirect = false;
+                else if (h is SocketsHttpHandler sh) sh.AllowAutoRedirect = false;
+            }
+            catch (InvalidOperationException)
+            {
+                throw new SiteWarmException("the supplied handler is already in use and may follow redirects; pass one with AllowAutoRedirect = false");
+            }
+        }
+    }
+
+    /// <summary>Reads at most <see cref="MaxBodyBytes"/> + 1 bytes; a larger body throws <see cref="ResponseTooLargeException"/>.</summary>
+    internal static async Task<string> ReadLimitedAsync(HttpContent content, CancellationToken ct)
+    {
+        await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var buf = new MemoryStream();
+        var chunk = new byte[81920];
+        int n;
+        while ((n = await stream.ReadAsync(chunk.AsMemory(), ct).ConfigureAwait(false)) > 0)
+        {
+            if (buf.Length + n > MaxBodyBytes) throw new ResponseTooLargeException(MaxBodyBytes);
+            buf.Write(chunk, 0, n);
+        }
+        return Encoding.UTF8.GetString(buf.GetBuffer(), 0, (int)buf.Length);
+    }
+
+    /// <summary><c>limit</c> must be 1..100 (null, empty or 0 = server default, not sent); invalid values never reach the server.</summary>
+    private static List<KeyValuePair<string, string?>> CheckedQuery(IReadOnlyDictionary<string, string?> query)
+    {
+        var list = new List<KeyValuePair<string, string?>>();
+        foreach (var kv in query)
+        {
+            if (kv.Value == null) continue;
+            if (kv.Key == "limit")
+            {
+                var v = kv.Value.Trim();
+                if (v.Length == 0 || v == "0") continue;
+                if (!int.TryParse(v, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var n) || n < 1 || n > 100)
+                    throw new SiteWarmException("limit must be an integer between 1 and 100");
+            }
+            list.Add(kv);
+        }
+        return list;
+    }
 
     private static JsonSerializerOptions BuildJsonOptions()
     {
@@ -121,7 +187,7 @@ public sealed class SiteWarmClient : IDisposable
         request ??= new Request();
         if (!Operations.Table.TryGetValue(operationId, out var op)) throw new SiteWarmException($"unknown operation \"{operationId}\"");
         var url = new StringBuilder(_baseUrl).Append(Expand(op.Path, request.PathParams));
-        var query = request.QueryParams.Where(kv => kv.Value != null).ToList();
+        var query = CheckedQuery(request.QueryParams);
         if (query.Count > 0)
             url.Append('?').Append(string.Join("&", query.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value!))));
         string? body = null;
@@ -133,12 +199,13 @@ public sealed class SiteWarmClient : IDisposable
         bool sendsKey = op.Idempotency != Idempotency.None && op.Method == "POST";
         // One key per call, reused by every retry, so a retried POST never starts a second run.
         string? key = sendsKey ? (request.IdempotencyKey ?? Guid.NewGuid().ToString()) : null;
-        // 429 = not processed. 5xx and network errors may have been, so retry them only when repeating is safe.
-        bool retryAmbiguous = op.Method != "POST" || sendsKey;
+        // 429 = not processed. 5xx, network errors and broken bodies may have been, so retry them only when repeating
+        // is safe: GET, HEAD, PUT, OPTIONS, or a POST with an Idempotency-Key. DELETE and PATCH: 429 only.
+        bool retryAmbiguous = op.Method is "GET" or "HEAD" or "PUT" or "OPTIONS" || sendsKey;
 
         for (int attempt = 0; ; attempt++)
         {
-            bool last = attempt >= _o.MaxRetries;
+            bool last = attempt >= _maxRetries;
             using var msg = new HttpRequestMessage(new HttpMethod(op.Method), url.ToString());
             msg.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
             msg.Headers.TryAddWithoutValidation("Accept", "application/json, application/problem+json");
@@ -146,18 +213,24 @@ public sealed class SiteWarmClient : IDisposable
             if (key != null) msg.Headers.TryAddWithoutValidation("Idempotency-Key", key);
             if (body != null) msg.Content = new StringContent(body, Encoding.UTF8, new MediaTypeHeaderValue("application/json"));
 
-            HttpResponseMessage resp;
+            HttpResponseMessage? resp = null;
             string text;
+            int? statusSoFar = null;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(_o.Timeout);
+            timeout.CancelAfter(_timeout);
             try
             {
-                resp = await _http.SendAsync(msg, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
-                text = await resp.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
+                resp = await _http.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+                statusSoFar = (int)resp.StatusCode;
+                if (resp.RequestMessage?.RequestUri is { } finalUri && finalUri != msg.RequestUri)
+                    throw new SiteWarmException("the HTTP handler followed a redirect; it must not (Authorization would leave the origin)");
+                text = await ReadLimitedAsync(resp.Content, timeout.Token).ConfigureAwait(false);
             }
-            catch (Exception e) when (e is HttpRequestException or OperationCanceledException && !ct.IsCancellationRequested)
+            catch (Exception e) when (e is HttpRequestException or IOException or OperationCanceledException && !ct.IsCancellationRequested)
             {
-                if (!last && retryAmbiguous)
+                resp?.Dispose();
+                // A body that breaks off is as ambiguous as a network error, except after a 429.
+                if (!last && (retryAmbiguous || statusSoFar == 429))
                 {
                     await _delay(Backoff(attempt), ct).ConfigureAwait(false);
                     continue;
@@ -166,8 +239,13 @@ public sealed class SiteWarmClient : IDisposable
                 bool timedOut = e is OperationCanceledException;
                 throw new ConnectionException(timedOut ? "request timed out" : "request failed", timedOut);
             }
+            catch
+            {
+                resp?.Dispose(); // ResponseTooLargeException, redirect, cancellation by the caller
+                throw;
+            }
 
-            using (resp)
+            using (resp!)
             {
                 int status = (int)resp.StatusCode;
                 var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -249,11 +327,14 @@ public sealed class SiteWarmClient : IDisposable
         });
 
     /// <summary>Iterates every item of a list operation across pages. Cursors are opaque.</summary>
-    public async IAsyncEnumerable<T> ItemsAsync<T>(string operationId, Request? request = null, [EnumeratorCancellation] CancellationToken ct = default)
+    /// <remarks>Throws if a cursor repeats or if <paramref name="maxPages"/> pages did not reach the end.</remarks>
+    public async IAsyncEnumerable<T> ItemsAsync<T>(string operationId, Request? request = null, [EnumeratorCancellation] CancellationToken ct = default,
+        int maxPages = DefaultMaxPages)
     {
         request ??= new Request();
         string? cursor = request.QueryParams.GetValueOrDefault("cursor");
-        for (int pages = 0; pages < 10_000; pages++)
+        var seen = new HashSet<string>(cursor == null ? Array.Empty<string>() : new[] { cursor });
+        for (int pages = 0; pages < maxPages; pages++)
         {
             var r = cursor == null ? request : request.WithQuery("cursor", cursor);
             var res = await ExchangeAsync(operationId, r, ct).ConfigureAwait(false);
@@ -276,9 +357,10 @@ public sealed class SiteWarmClient : IDisposable
             }
             foreach (var i in items) yield return i;
             if (!more || string.IsNullOrEmpty(next)) yield break;
-            if (next == cursor) throw new SiteWarmException("pagination cursor did not advance");
+            if (!seen.Add(next)) throw new SiteWarmException("pagination cursor did not advance");
             cursor = next;
         }
+        throw new SiteWarmException($"pagination stopped after {maxPages} pages without reaching the end");
     }
 
     internal DateTimeOffset Now() => _clock();

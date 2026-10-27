@@ -17,6 +17,14 @@ public sealed class ConnectionException : SiteWarmException
     public ConnectionException(string message, bool timeout = false) : base(message) => Timeout = timeout;
 }
 
+/// <summary>The response body was larger than the SDK reads (32 MiB). Not retried.</summary>
+public sealed class ResponseTooLargeException : SiteWarmException
+{
+    public int Limit { get; }
+
+    public ResponseTooLargeException(int limit) : base($"response body is larger than {limit} bytes") => Limit = limit;
+}
+
 /// <summary>The wait ran out. The run itself is not canceled.</summary>
 public sealed class WaitTimeoutException : SiteWarmException
 {
